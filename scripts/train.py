@@ -25,7 +25,7 @@ from omegaconf import OmegaConf
 import wandb
 
 # Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.models.tam_vit import create_tam_vit_base
 from src.models.losses import compute_class_weights
