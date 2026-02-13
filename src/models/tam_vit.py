@@ -671,6 +671,18 @@ class TAMViT(nn.Module):
             'total_uncertainty': epistemic + aleatoric,
             'predictions': preds,
         }
+    
+    def mc_inference(
+        self,
+        x: torch.Tensor,
+        n_samples: int = 30,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Alias for predict_with_mc_dropout for compatibility with trainer.
+        
+        Runs MC Dropout inference (with gradient computation if needed).
+        """
+        return self.predict_with_mc_dropout(x, n_samples)
 
 
 def create_tam_vit_base(num_classes: int = 9, pretrained: bool = False, in_chans: int = 3) -> TAMViT:

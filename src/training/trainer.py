@@ -29,7 +29,7 @@ from pytorch_lightning.callbacks import (
 )
 from pytorch_lightning.loggers import WandbLogger, TensorBoardLogger
 import numpy as np
-from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
+from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, confusion_matrix
 
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
@@ -125,16 +125,26 @@ class DermEquityModule(pl.LightningModule):
         # Compute loss
         loss, loss_dict = self.criterion(outputs, labels)
         
-        # Log loss
+        # Log loss components
         self.log('val/loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        for name, value in loss_dict.items():
+            self.log(f'val/{name}', value, on_step=False, on_epoch=True)
         
         # Store predictions for epoch-end metrics
-        probs = outputs['probs'].detach().cpu()
+        if isinstance(outputs, dict) and 'probs' in outputs:
+            probs = outputs['probs'].detach().cpu()
+        else:
+            probs = torch.softmax(outputs if isinstance(outputs, torch.Tensor) else outputs['logits'], dim=-1).cpu()
+        
         self.val_preds.append(probs)
         self.val_labels.append(labels.cpu())
         self.val_tones.append(fitzpatrick.cpu())
     
     def on_validation_epoch_end(self) -> None:
+        """Compute and log validation metrics including fairness."""
+        if not self.val_preds:
+            return
+        
         # Aggregate predictions
         all_probs = torch.cat(self.val_preds, dim=0).numpy()
         all_labels = torch.cat(self.val_labels, dim=0).numpy()
@@ -155,7 +165,13 @@ class DermEquityModule(pl.LightningModule):
         self.log('val/f1_macro', f1, prog_bar=True)
         self.log('val/accuracy', acc)
         
-        # Subgroup metrics by Fitzpatrick type
+        # ==============================================
+        # FAIRNESS METRICS BY FITZPATRICK TYPE
+        # ==============================================
+        tone_aucs = {}
+        tone_sensitivities = {}
+        tone_specificities = {}
+        
         for tone in range(6):  # 0-5 (Fitzpatrick I-VI)
             mask = all_tones == tone
             if mask.sum() > 10:  # Minimum samples for meaningful metric
@@ -164,27 +180,53 @@ class DermEquityModule(pl.LightningModule):
                         all_labels[mask], all_probs[mask],
                         multi_class='ovr', average='macro'
                     )
+                    tone_aucs[tone] = tone_auc
                     self.log(f'val/auc_fitz_{tone+1}', tone_auc)
+                    
+                    # Sensitivity (recall)
+                    from sklearn.metrics import recall_score
+                    tone_sens = recall_score(all_labels[mask], all_preds[mask], average='macro', zero_division=0)
+                    tone_sensitivities[tone] = tone_sens
+                    self.log(f'val/sens_fitz_{tone+1}', tone_sens)
+                    
+                    # Specificity (per-class TNR averaged)
+                    cm = confusion_matrix(all_labels[mask], all_preds[mask], labels=range(len(np.unique(all_labels))))
+                    specificities = []
+                    for i in range(len(cm)):
+                        tn = cm.sum() - cm[i, :].sum() - cm[:, i].sum() + cm[i, i]
+                        fp = cm[:, i].sum() - cm[i, i]
+                        specificity = tn / (tn + fp + 1e-8)
+                        specificities.append(specificity)
+                    tone_spec = np.mean(specificities)
+                    tone_specificities[tone] = tone_spec
+                    self.log(f'val/spec_fitz_{tone+1}', tone_spec)
+                    
                 except ValueError:
                     pass
         
-        # Log fairness gap (max - min AUC across tones)
-        tone_aucs = []
-        for tone in range(6):
-            mask = all_tones == tone
-            if mask.sum() > 10:
-                try:
-                    tone_auc = roc_auc_score(
-                        all_labels[mask], all_probs[mask],
-                        multi_class='ovr', average='macro'
-                    )
-                    tone_aucs.append(tone_auc)
-                except ValueError:
-                    pass
-        
+        # Fairness gap (AUC difference between darkest and lightest skin tones)
         if len(tone_aucs) >= 2:
-            fairness_gap = max(tone_aucs) - min(tone_aucs)
+            sorted_tones = sorted(tone_aucs.keys())
+            # Light skin tones (I-II) vs Dark skin tones (V-VI)
+            light_auc = np.mean([tone_aucs.get(t, 0) for t in [0, 1]])
+            dark_auc = np.mean([tone_aucs.get(t, 0) for t in [4, 5]])
+            
+            fairness_gap = abs(light_auc - dark_auc)
             self.log('val/fairness_gap', fairness_gap, prog_bar=True)
+            
+            # Also log max-min gap
+            max_min_gap = max(tone_aucs.values()) - min(tone_aucs.values())
+            self.log('val/gap_max_min', max_min_gap)
+            
+            # Sensitivity gap  
+            if len(tone_sensitivities) >= 2:
+                sens_gap = max(tone_sensitivities.values()) - min(tone_sensitivities.values())
+                self.log('val/sensitivity_gap', sens_gap)
+            
+            # Specificity gap
+            if len(tone_specificities) >= 2:
+                spec_gap = max(tone_specificities.values()) - min(tone_specificities.values())
+                self.log('val/specificity_gap', spec_gap)
         
         # Clear stored predictions
         self.val_preds.clear()
@@ -192,23 +234,57 @@ class DermEquityModule(pl.LightningModule):
         self.val_tones.clear()
     
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
-        # Same as validation but with MC Dropout
+        """
+        Test step with MC Dropout for uncertainty quantification.
+        
+        MC Dropout runs multiple forward passes with dropout enabled
+        to estimate epistemic uncertainty (model uncertainty).
+        """
         images = batch['image']
         labels = batch['label']
         
-        # MC Dropout for uncertainty
-        mc_outputs = self.model.predict_with_mc_dropout(images, n_samples=30)
+        # MC Dropout inference (if model supports it)
+        mc_enabled = self.train_config.get('mc_dropout_enabled', False)
+        mc_samples = self.train_config.get('mc_samples', 30)
         
-        # Store for epoch-end processing
-        self.val_preds.append(mc_outputs['mean_probs'].cpu())
+        if mc_enabled and hasattr(self.model, 'mc_inference'):
+            # Expert: Model has explicit MC inference method
+            try:
+                mc_outputs = self.model.mc_inference(images, n_samples=mc_samples)
+                
+                # Log uncertainty statistics
+                epistemic = mc_outputs.get('epistemic_uncertainty', torch.tensor(0.0))
+                aleatoric = mc_outputs.get('aleatoric_uncertainty', torch.tensor(0.0))
+                
+                mean_epistemic = epistemic.mean() if isinstance(epistemic, torch.Tensor) else torch.tensor(epistemic)
+                mean_aleatoric = aleatoric.mean() if isinstance(aleatoric, torch.Tensor) else torch.tensor(aleatoric)
+                
+                self.log('test/epistemic_uncertainty', mean_epistemic)
+                self.log('test/aleatoric_uncertainty', mean_aleatoric)
+                
+                # Store predictions
+                if 'mean_probs' in mc_outputs:
+                    self.val_preds.append(mc_outputs['mean_probs'].cpu())
+                elif 'probs' in mc_outputs:
+                    self.val_preds.append(mc_outputs['probs'].cpu())
+            except Exception as e:
+                print(f"MC inference failed: {e}, falling back to standard inference")
+                # Fall through to standard inference
+        
+        if not self.val_preds:  # Standard inference as fallback
+            outputs = self.model(images, return_uncertainty=True)
+            
+            if isinstance(outputs, dict):
+                if 'probs' in outputs:
+                    probs = outputs['probs'].cpu()
+                else:
+                    probs = torch.softmax(outputs['logits'], dim=-1).cpu()
+            else:
+                probs = torch.softmax(outputs, dim=-1).cpu()
+            
+            self.val_preds.append(probs)
+        
         self.val_labels.append(labels.cpu())
-        
-        # Log uncertainty statistics
-        epistemic = mc_outputs['epistemic_uncertainty'].mean()
-        aleatoric = mc_outputs['aleatoric_uncertainty'].mean()
-        
-        self.log('test/epistemic_uncertainty', epistemic)
-        self.log('test/aleatoric_uncertainty', aleatoric)
     
     def configure_optimizers(self):
         # Get parameters with layer-wise learning rate decay

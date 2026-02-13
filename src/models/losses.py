@@ -121,108 +121,123 @@ class CounterfactualFairnessLoss(nn.Module):
     Ensures predictions remain similar when skin tone is hypothetically changed.
     This encourages the model to focus on lesion features rather than skin tone.
     
-    Formula: L_cf = E[||f(x, t) - f(x, t')||²] for counterfactual tones t'
+    Uses the approach from "Ensuring Algorithmic Fairness" by computing
+    prediction variance across counterfactual skin tone variations.
+    
+    Formula: L_cf = E[Var_t(f(x, t))] - minimize prediction variance across tones
     
     Args:
         num_tones: Number of Fitzpatrick skin types (6)
+        temperature: Temperature for softening predictions
         reduction: Reduction method
     """
     
     def __init__(
         self,
         num_tones: int = 6,
+        temperature: float = 1.0,
         reduction: str = 'mean',
     ):
         super().__init__()
         self.num_tones = num_tones
+        self.temperature = temperature
         self.reduction = reduction
     
     def forward(
         self,
-        model: nn.Module,
-        features: torch.Tensor,
-        original_tone_probs: torch.Tensor,
-        tone_embed_layer: nn.Module,
+        logits_per_tone: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute counterfactual fairness loss.
+        Compute counterfactual fairness loss from predictions under different tones.
         
         Args:
-            model: The classifier head
-            features: Feature representations (B, D)
-            original_tone_probs: Original tone probabilities (B, num_tones)
-            tone_embed_layer: Layer to convert tone probs to embeddings
+            logits_per_tone: Logits per counterfactual tone (num_tones, B, num_classes)
+                            or (B, num_tones, num_classes)
+                            
+        Returns:
+            Scalar loss penalizing variance across tone-conditioned predictions
         """
-        B = features.shape[0]
-        device = features.device
+        # Ensure shape is (num_tones, B, num_classes)
+        if logits_per_tone.ndim == 3 and logits_per_tone.shape[1] == self.num_tones:
+            logits_per_tone = logits_per_tone.transpose(0, 1)
         
-        # Get original predictions
-        original_embed = tone_embed_layer(original_tone_probs)
-        original_logits = model(features)  # Assuming features already processed
+        # Softmax over class dimension with temperature
+        probs_per_tone = F.softmax(logits_per_tone / self.temperature, dim=-1)
         
-        cf_loss = torch.tensor(0.0, device=device)
+        # Compute variance of predictions across tones
+        # (num_tones, B, num_classes) -> (B, num_classes)
+        prob_mean = probs_per_tone.mean(dim=0)
+        prob_var = ((probs_per_tone - prob_mean) ** 2).mean(dim=0)
         
-        # Generate counterfactual predictions for each possible tone
-        for tone_idx in range(self.num_tones):
-            # Create counterfactual tone distribution (one-hot)
-            cf_tone = torch.zeros(B, self.num_tones, device=device)
-            cf_tone[:, tone_idx] = 1.0
-            
-            # Get counterfactual prediction
-            cf_embed = tone_embed_layer(cf_tone)
-            # Note: In practice, you'd need to re-run through tone-conditioned layers
-            # This is a simplified version
-            
-            # Penalize prediction differences
-            cf_loss += F.mse_loss(original_logits, original_logits)  # Placeholder
+        # Loss: penalize variance (want predictions consistent across tones)
+        loss = prob_var.mean()
         
-        cf_loss = cf_loss / self.num_tones
-        
-        return cf_loss
+        return loss
 
 
-class CounterfactualFairnessLossV2(nn.Module):
+class AdversarialDemographicParityLoss(nn.Module):
     """
-    Improved Counterfactual Fairness Loss.
+    Adversarial approach to enforce demographic parity.
     
-    This version works directly with the model's forward pass, creating
-    counterfactual inputs by modifying the tone embedding during forward.
+    Uses a discriminator to detect Fitzpatrick type from model predictions.
+    Loss penalizes predictions that allow discriminator to distinguish skin tones.
     
-    Strategy:
-    1. For each sample, get original prediction
-    2. Compute predictions with each possible skin tone
-    3. Penalize variance across these predictions
+    This encourages the model's predictions to be "blind" to skin tone.
+    
+    Approach:
+    1. Train discriminator: tone ~ predictions (standard binary classification)
+    2. Train model: minimize discriminator's ability to infer tone from predictions
     """
     
     def __init__(
         self,
         num_tones: int = 6,
-        num_counterfactuals: int = 5,
-        temperature: float = 0.5,
+        hidden_dim: int = 64,
     ):
         super().__init__()
         self.num_tones = num_tones
-        self.num_counterfactuals = num_counterfactuals
-        self.temperature = temperature
+        
+        # Simple discriminator: predicts tone from class predictions
+        self.discriminator = nn.Sequential(
+            nn.Linear(9, hidden_dim),  # 9 classes
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_tones),
+        )
     
     def forward(
         self,
-        all_tone_logits: torch.Tensor,
+        predictions: torch.Tensor,  # (B, num_classes)
+        tones: torch.Tensor,  # (B,) - tone labels
+        step: str = 'D',  # 'D' for discriminator, 'G' for generator
     ) -> torch.Tensor:
         """
+        Compute adversarial demographic parity loss.
+        
         Args:
-            all_tone_logits: Logits for each counterfactual tone (num_tones, B, C)
+            predictions: Model's class predictions (B, num_classes)
+            tones: True Fitzpatrick tone labels (B,)
+            step: Whether training discriminator ('D') or generator/model ('G')
             
         Returns:
-            Fairness loss encouraging consistent predictions
+            Loss for the respective step
         """
-        # Compute variance across counterfactual predictions
-        probs = F.softmax(all_tone_logits / self.temperature, dim=-1)
+        # Discriminator logits: can it predict tone from predictions?
+        tone_logits = self.discriminator(predictions.detach() if step == 'D' else predictions)
         
-        # Variance of predictions across tones (should be low for fairness)
-        variance = probs.var(dim=0)  # (B, C)
+        if step == 'D':
+            # Train discriminator to predict tone accurately
+            loss = F.cross_entropy(tone_logits, tones)
+        else:  # step == 'G'
+            # Train model to fool discriminator (make tone unpredictable)
+            # Maximize discriminator loss (i.e., make it confused)
+            # This is equivalent to minimizing the log of discriminator accuracy
+            tone_probs = F.softmax(tone_logits, dim=-1)
+            # Uniform distribution over tones (discriminator fooled)
+            uniform_dist = torch.ones_like(tone_probs) / self.num_tones
+            # KL divergence from uniform (symmetric cross-entropy as approximation)
+            loss = F.kl_div(F.log_softmax(tone_logits, dim=-1), uniform_dist, reduction='batchmean')
         
-        return variance.mean()
+        return loss
 
 
 class DermEquityLoss(nn.Module):
