@@ -2,14 +2,14 @@
 # Python 3.9+ required
 
 # Core Deep Learning
-torch==2.1.0
-torchvision==0.16.0
-pytorch-lightning==2.1.0
-timm==0.9.12
+torch==2.3.0
+torchvision==0.18.0
+pytorch-lightning==2.1.2
+timm==0.9.16
 
 # Data Processing
-numpy==1.24.3
-pandas==2.0.3
+numpy==1.24.4
+pandas==2.1.1
 scikit-learn==1.3.2
 scipy==1.11.4
 
@@ -37,6 +37,14 @@ omegaconf==2.3.0
 hydra-core==1.3.2
 pyyaml==6.0.1
 
+# API & Inference
+fastapi==0.104.1
+uvicorn==0.24.0
+pydantic==2.4.2
+
+# Transformer utilities
+einops==0.7.0
+
 # Utilities
 tqdm==4.66.1
 rich==13.7.0
@@ -48,6 +56,7 @@ streamlit==1.28.2
 
 # Testing
 pytest==7.4.3
+kaggle==1.5.13
 pytest-cov==4.1.0
 
 # Fairness & Uncertainty
