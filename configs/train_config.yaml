@@ -1,0 +1,285 @@
+# DERM-EQUITY Training Configuration
+# Optimized for RTX 4090 / Google Colab Pro+
+
+# =============================================================================
+# Model Configuration
+# =============================================================================
+model:
+  name: tam_vit_base
+  img_size: 224
+  patch_sizes: [16, 8]  # Multi-scale patches
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4.0
+  dropout: 0.1
+  attention_dropout: 0.0
+  drop_path: 0.1  # Stochastic depth
+  num_classes: 9  # ISIC 2020 classes
+  
+  # Pretrained weights
+  pretrained: true
+  pretrained_path: "google/vit-base-patch16-224-in21k"
+  
+  # Skin tone estimation branch
+  tone_estimator:
+    enabled: true
+    num_tones: 6  # Fitzpatrick I-VI
+    embed_dim: 768
+
+  # Uncertainty head
+  uncertainty:
+    enabled: true
+    mc_dropout_rate: 0.1
+    num_mc_samples: 30
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+data:
+  # Primary dataset
+  train_data_dir: "./data/isic2020/train"
+  val_data_dir: "./data/isic2020/val"
+  test_data_dir: "./data/isic2020/test"
+  
+  # External validation
+  external_val_dir: "./data/fitzpatrick17k"
+  ddi_dir: "./data/ddi"
+  
+  # Data loading
+  batch_size: 32
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  
+  # Class labels (ISIC 2020)
+  classes:
+    - melanoma
+    - melanocytic_nevus
+    - basal_cell_carcinoma
+    - actinic_keratosis
+    - benign_keratosis
+    - dermatofibroma
+    - vascular_lesion
+    - squamous_cell_carcinoma
+    - unknown
+
+  # Sampling strategy for class imbalance
+  sampler:
+    type: weighted_random
+    weights_per_class: true
+    replacement: true
+
+# =============================================================================
+# Augmentation Configuration
+# =============================================================================
+augmentation:
+  # Training augmentations (medical-appropriate)
+  train:
+    random_resized_crop:
+      size: 224
+      scale: [0.8, 1.0]
+      ratio: [0.9, 1.1]
+    
+    horizontal_flip: 0.5
+    vertical_flip: 0.5
+    random_rotate_90: 0.5
+    
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.1
+      hue: 0.05
+      p: 0.5
+    
+    gaussian_noise:
+      var_limit: [10, 50]
+      p: 0.3
+    
+    gaussian_blur:
+      blur_limit: [3, 5]
+      p: 0.2
+    
+    # Advanced augmentation
+    mixup:
+      alpha: 0.2
+      p: 0.5
+    
+    cutmix:
+      alpha: 1.0
+      p: 0.5
+    
+    # NO extreme geometric distortions (unrealistic for medical)
+    # NO extreme color changes that could alter diagnosis
+  
+  # Validation/Test augmentations
+  val:
+    resize: 256
+    center_crop: 224
+
+  # Normalization (ImageNet stats)
+  normalize:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+
+# =============================================================================
+# Training Configuration
+# =============================================================================
+training:
+  epochs: 100
+  
+  # Early stopping
+  early_stopping:
+    patience: 15
+    monitor: "val/auc_roc"
+    mode: "max"
+    min_delta: 0.001
+  
+  # Gradient settings
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 2  # Effective batch size: 64
+  
+  # Mixed precision
+  precision: 16
+  
+  # Checkpointing
+  checkpoint:
+    save_top_k: 3
+    monitor: "val/auc_roc"
+    mode: "max"
+    filename: "epoch={epoch:02d}-auc={val/auc_roc:.4f}"
+
+# =============================================================================
+# Optimizer Configuration
+# =============================================================================
+optimizer:
+  name: AdamW
+  lr: 1.0e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  
+  # Layer-wise learning rate decay (LLRD)
+  layer_decay: 0.75  # Earlier layers learn slower
+  
+  # Warmup
+  warmup_epochs: 5
+  warmup_lr: 1.0e-6
+
+# =============================================================================
+# Scheduler Configuration
+# =============================================================================
+scheduler:
+  name: CosineAnnealingWarmRestarts
+  T_0: 10
+  T_mult: 2
+  eta_min: 1.0e-6
+
+# =============================================================================
+# Loss Configuration
+# =============================================================================
+loss:
+  # Focal loss for class imbalance
+  focal:
+    gamma: 2.0
+    alpha: null  # Auto-computed from class frequencies
+    weight: 1.0
+  
+  # Uncertainty calibration loss
+  uncertainty:
+    weight: 0.1
+    type: "nll"  # Negative log-likelihood with learned variance
+  
+  # Counterfactual fairness loss
+  fairness:
+    weight: 0.5
+    type: "counterfactual"
+    num_counterfactuals: 5
+
+# =============================================================================
+# Evaluation Configuration
+# =============================================================================
+evaluation:
+  # Metrics to compute
+  metrics:
+    - auc_roc
+    - auc_pr
+    - f1_macro
+    - f1_weighted
+    - accuracy
+    - sensitivity
+    - specificity
+    - precision
+    - recall
+  
+  # Confidence intervals
+  bootstrap:
+    enabled: true
+    n_iterations: 1000
+    confidence_level: 0.95
+  
+  # Subgroup analysis
+  subgroups:
+    - fitzpatrick_type
+    - age_group
+    - sex
+    - lesion_location
+  
+  # Calibration
+  calibration:
+    n_bins: 15
+    metrics: [ece, mce]
+  
+  # Uncertainty thresholds for deferral
+  deferral:
+    enabled: true
+    uncertainty_threshold: 0.3
+    target_coverage: 0.9
+
+# =============================================================================
+# Logging Configuration
+# =============================================================================
+logging:
+  # Weights & Biases
+  wandb:
+    enabled: true
+    project: "derm-equity"
+    entity: null  # Set to your username
+    tags: ["tam-vit", "fairness", "uncertainty"]
+    log_model: true
+  
+  # TensorBoard
+  tensorboard:
+    enabled: true
+    log_dir: "./logs/tensorboard"
+  
+  # Logging frequency
+  log_every_n_steps: 50
+  val_check_interval: 1.0  # Validate every epoch
+
+# =============================================================================
+# Hardware Configuration
+# =============================================================================
+hardware:
+  gpus: 1
+  accelerator: "gpu"
+  strategy: "auto"
+  
+  # For multi-GPU (if available)
+  # gpus: [0, 1]
+  # strategy: "ddp"
+
+# =============================================================================
+# Reproducibility
+# =============================================================================
+seed: 42
+deterministic: false  # Set true for full determinism (slower)
+
+# =============================================================================
+# Paths
+# =============================================================================
+paths:
+  output_dir: "./outputs"
+  checkpoint_dir: "./checkpoints"
+  log_dir: "./logs"
+  cache_dir: "./cache"

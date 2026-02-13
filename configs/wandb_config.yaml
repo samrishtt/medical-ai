@@ -1,0 +1,173 @@
+# ============================================================================
+# DERM-EQUITY Weights & Biases Configuration
+# ============================================================================
+# 
+# Setup Instructions:
+# 1. Create account at https://wandb.ai/
+# 2. Run: wandb login
+# 3. Enter your API key when prompted
+# 4. Update project/entity below
+#
+# ============================================================================
+
+# Project settings
+project: "derm-equity"
+entity: null  # Your W&B username or team name (null for default)
+name: null    # Run name (null for auto-generated)
+notes: "DERM-EQUITY: Equitable Skin Cancer Detection"
+tags:
+  - medical-ai
+  - skin-cancer
+  - fairness
+  - uncertainty
+  - vision-transformer
+
+# Logging settings
+log_freq: 50  # Log every N steps
+log_model: true  # Log model checkpoints
+log_code: true   # Log code for reproducibility
+
+# Sync settings
+mode: "online"  # online, offline, or disabled
+save_code: true
+
+# Sweep configuration (for hyperparameter tuning)
+sweep:
+  name: "derm-equity-sweep"
+  method: "bayes"  # grid, random, or bayes
+  
+  metric:
+    name: "val/auc_roc"
+    goal: "maximize"
+  
+  parameters:
+    learning_rate:
+      distribution: "log_uniform_values"
+      min: 1e-5
+      max: 1e-3
+    
+    batch_size:
+      values: [16, 32, 64]
+    
+    dropout:
+      distribution: "uniform"
+      min: 0.0
+      max: 0.5
+    
+    lambda_fair:
+      distribution: "uniform"
+      min: 0.1
+      max: 1.0
+    
+    lambda_unc:
+      distribution: "uniform"
+      min: 0.05
+      max: 0.3
+    
+    weight_decay:
+      distribution: "log_uniform_values"
+      min: 1e-4
+      max: 0.1
+    
+    tone_embed_dim:
+      values: [64, 128, 256]
+  
+  early_terminate:
+    type: "hyperband"
+    min_iter: 10
+    eta: 3
+
+# Alerts configuration
+alerts:
+  - type: "scriptable"
+    name: "val_auc_high"
+    condition: "val/auc_roc > 0.92"
+    alerting_condition: "on"
+  
+  - type: "scriptable"
+    name: "fairness_gap_low"
+    condition: "val/fairness_gap < 0.10"
+    alerting_condition: "on"
+
+# Report configuration
+report:
+  title: "DERM-EQUITY Training Report"
+  description: "Equitable Skin Cancer Detection Results"
+  
+  panels:
+    - type: "run_comparer"
+      config:
+        metrics:
+          - "val/auc_roc"
+          - "val/fairness_gap"
+          - "val/ece"
+    
+    - type: "line"
+      config:
+        title: "Training Loss"
+        metrics:
+          - "train/loss"
+          - "val/loss"
+    
+    - type: "line"
+      config:
+        title: "AUC-ROC by Skin Tone"
+        metrics:
+          - "val/auc_fitz_1_2"
+          - "val/auc_fitz_3_4"
+          - "val/auc_fitz_5_6"
+    
+    - type: "line"
+      config:
+        title: "Uncertainty Metrics"
+        metrics:
+          - "val/epistemic_uncertainty"
+          - "val/aleatoric_uncertainty"
+    
+    - type: "bar"
+      config:
+        title: "Fairness Metrics"
+        metrics:
+          - "val/demographic_parity"
+          - "val/equalized_odds"
+          - "val/fairness_gap"
+
+# Custom charts
+custom_charts:
+  reliability_diagram:
+    type: "custom"
+    config:
+      chart_type: "scatter"
+      x_axis: "confidence"
+      y_axis: "accuracy"
+      title: "Reliability Diagram"
+  
+  roc_curve:
+    type: "custom"
+    config:
+      chart_type: "line"
+      x_axis: "fpr"
+      y_axis: "tpr"
+      title: "ROC Curve by Skin Tone"
+
+# Artifact settings
+artifacts:
+  model:
+    type: "model"
+    description: "TAM-ViT model checkpoint"
+    metadata:
+      framework: "pytorch"
+      architecture: "TAM-ViT"
+  
+  dataset:
+    type: "dataset"
+    description: "Training data manifest"
+    metadata:
+      datasets:
+        - "ISIC2020"
+        - "Fitzpatrick17k"
+        - "DDI"
+  
+  evaluation:
+    type: "evaluation"
+    description: "Evaluation results and metrics"
